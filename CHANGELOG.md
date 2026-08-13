@@ -1,6 +1,1478 @@
 # Changelog
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.19.14 — feat(agent): `agent send` enforces a ROUND cap, not a character cap (DIVE-3318)
+
+The a2a terseness rule has been live in `CLAUDE.md` and unenforced. It is now a refusal in
+both delivery paths.
+
+**Not a character cap, and the measurement is why.** `agent-audit.log` has carried `bytes=`
+on every send since DIVE-2797 and nobody had read it. Over the 24h to 2026-08-12T05:38Z on
+this box: **1047 messages, 1624 KB — roughly 415k tokens of text against ~97M tokens of
+fleet burn, 0.43%.** Message LENGTH is not the cost. A character cap would target the wrong
+axis and would strip exactly the evidence blocks worth sending. The cost is that each
+inbound makes the recipient re-read logs, re-check state and re-derive — a 2 KB message is
+answered with twenty tool calls, which is also why "be concise" does not work.
+
+Two controls, deliberately **not** the same strength — a control may only refuse what it can
+actually identify:
+
+- **Round cap — a WARNING.** Two sends per (sender → recipient → topic), rolling 24h; the
+  third and later warn on stderr, naming the count, the row and the remedy (`task set-body`),
+  and the send proceeds. Topic is the first task ident in the body, or the pair itself when
+  there is none. Per direction, so a topic affords two full exchanges before it says anything.
+
+  The row as filed said "refuse, not warn". That was overturned on the gate by a day of
+  evidence: on DIVE-3320 the same day, **every message that made the work right arrived at
+  round 3 or later** — a local-path-origin correction (502 phantom commits), a
+  multi-commit-squash correction, an `--all` correction (19,060 was an artifact), plus the two
+  rounds that produced the staged-vs-safe distinction. A hard cap would have shipped a wrong
+  recipe to eight seats. **A round counter cannot tell agreement from a correction, and the
+  correction is the expensive one to lose** — so the counter warns, and the warning explicitly
+  tells a correction to send anyway.
+- **Acknowledgement refusal — still a REFUSAL.** The ack detector *can* see that a message
+  carries nothing, which is exactly what the counter cannot do. A short body that is substantially "ack / agreed / taking it
+  / thank you" and carries no RESULT, EVIDENCE, BLOCKER, NEXT or question is refused and
+  costs no round. A message that merely *opens* with "agreed —" and then reports something
+  is not an ack and is not touched.
+
+Enforced in **both** `cmd_send` (direct/root) and `cmd_deliver` (the scoped `_deliver` grant
+every standard-isolation agent re-execs into) — a cap in `cmd_send` alone would be a cap on
+admins, i.e. on nobody being counted. **No sender is exempt by role**: the lead was the
+largest single sender in the measurement, so a lead exemption exempts the problem. The
+one-way notification rails (gate routing, supervisor alerts) are marked as non-rounds and
+carry that marker across the `sudo` re-exec, because sudo scrubs the environment and a
+refused gate ping is a gate nobody hears about.
+
+`5dive digest` now prints the per-sender send/KB split and any topic sitting at the cap.
+
+## v0.19.14 — fix(tests): council_roster_class_thresholds_e2e reaches its verdict in CI (DIVE-3282)
+
+`tests/council_roster_class_thresholds_e2e.sh` (DIVE-2890) skipped in *every* probe environment —
+`harness-verdict-union` read it NEVER PROBED, which reds full-sweep on every sha carrying the file
+and froze the release cut.
+
+Cause: `council init` seals genesis on the root gate-proof rail, and the non-root rail resolves
+`5dive` **by name off PATH**. That rail works on the control-plane host (whose sudoers grants
+NOPASSWD to `/usr/local/bin/5dive` and nothing else) and on no GitHub runner, since neither probe
+environment installs the CLI. The harness therefore graded nothing, anywhere, while reporting green.
+
+It now takes whichever rail the environment has — re-exec under passwordless sudo and seal
+in-process (the idiom already carrying `council_veto_e2e.sh` and `constitution_set_e2e.sh`),
+falling back to the by-name rail — and skips only when there is no rail at all. A seal that fails
+while running as root is now a FAIL, not a skip: root has the in-process rail, so that outcome is a
+defect rather than an environment.
+
+No allowlist entry: the harness is wired, and it now runs.
+
+## v0.19.14 — feat(task): `set-parent`, and the bare-number parent guard on `task add` (DIVE-3275)
+
+`parent_id` was **INSERT-only**: `task add --parent=` was the sole moment a parent
+edge could ever be written, so a row filed without it could never be attached
+afterwards and the relationship survived only as prose in a body.
+
+That already cost a verification. `DIVE-3138` was split out of `DIVE-2895` with the
+words *"split out of DIVE-2895 items (1) and (2)"* but filed unparented, so
+`task show DIVE-2895` rendered no edge to it and the maker closing `DIVE-2895`
+asserted an item was blocked on work `DIVE-3138` had finished 2h36m earlier. The
+fix list said *"set parent_id on DIVE-3138"* — and no verb could.
+
+```
+5dive task set-parent <id|DIVE-N> <DIVE-N|none>      # 'none' detaches
+```
+
+### A CLOSED row CAN be re-parented — deliberately not `set-title`'s refusal
+
+A close freezes the record of what was **asserted** — body and result, the text a
+later reader quotes back. `parent_id` is not an assertion by the closer; it is a
+navigation edge, and its **absence** is the entire defect: `DIVE-3138` was already
+closed when its missing edge produced the false premise. A blanket closed-row
+refusal would have shipped a verb that cannot fix the case that motivated it.
+
+Audited like `set-title` (prior parent + new parent + actor), and it does not
+reopen the row, touch `done_at`, or bump `updated_at` — the write is to the graph,
+and nothing about the closed record's own timeline changes.
+
+### The bare-number guard, which `task add --parent` does not have
+
+`resolve_task_id()` branches on argument **shape**: `^[0-9]+$` is the global row
+`id`, `^[A-Za-z]+-[0-9]+$` is the `ident`. The two number spaces have diverged —
+measured on the live store: **`DIVE-2895` is row id 3082, and row id 2895 is
+`DIVE-2708`**, a cancelled row from another month. A bare number is therefore a
+valid id naming the wrong row with no error at all, which is exactly how
+`DIVE-3273` was filed under the wrong parent.
+
+So a bare number whose row carries a **different** ident number is refused, naming
+both the row it resolved to and the one the caller probably meant:
+
+```
+$ 5dive task set-parent DIVE-3138 2895
+error: '2895' as the parent is the global row id, which resolves to DIVE-2708
+("Daily lodar personal-X take …") — not to an ident numbered 2895. … re-run
+naming the row you mean: … DIVE-2708 (or DIVE-2895 if that is what you meant).
+```
+
+An *agreeing* bare number is accepted with a loud warning; the ident form is the
+quiet path, so the warning never becomes background noise. Applied to **both**
+arguments — a mis-resolved child re-parents the wrong row, the identical failure.
+
+The previous remedy for this was a written rule (*"always `--parent=DIVE-####`"*),
+and a rule is not a guard.
+
+**The same guard is now on `task add --parent`, the surface that actually
+misfired** — folded into this row rather than filed separately (main's call): it
+is one function away on the same surface, and a separate ident would have bought
+a second review of the same code. `task add --parent=2895` now refuses instead of
+silently filing under `DIVE-2708`, and refuses **before the INSERT**, since a row
+created under the wrong parent is the damage. The guard itself lives in
+`src/lib/tasks_db.sh` beside `resolve_task_id()`, because it is a statement about
+that function's two number spaces rather than about any one verb — so its refusal
+names the argument (`--parent`, `the parent`, `the task to re-parent`) instead of
+naming a verb. Both help lines now read `--parent=<DIVE-N>`; `--parent=<id>` is
+what made the bare form look intended.
+
+### The receipt prints the parent's child list
+
+A parent edge is verified by the **reader's** view, not by the writer's exit code.
+`set-parent` therefore prints the parent's resulting subtask list, so the command
+is self-verifying and the follow-up `task show <parent>` that everyone forgets is
+gone. On a detach it prints the **former** parent's list — that is where the
+absence has to be visible.
+
+### Also refused
+
+`parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE`, so a wrong parent does
+not merely mis-render, it arms the child's deletion. Refused: self-parenting; a
+cycle (the target's ancestor chain is walked, **bounded at 64 hops**, so a
+pre-existing cycle in the store refuses rather than hangs); a nonexistent parent;
+and a recurring **template**, which is top-level by construction — the same thing
+`task add` already says when it refuses `--recurring` with `--parent`.
+
+### Tests
+
+New `tests/task_set_parent_unit.sh` — 57 arms, no root, no network, core tier.
+The arms grade the decisions rather than the `UPDATE`: **A1** re-parents a row that
+is already `done` and asserts it did not reopen; **C5** plants a pre-existing cycle
+by raw sqlite write and asserts the walk refuses instead of spinning; **D1/D2**
+reproduce the id/ident divergence with explicit row ids and assert the refusal on
+both arguments; **D3** asserts an agreeing bare number still warns while **D4**
+asserts the ident form warns about nothing; **F1** grades the acceptance shape —
+`task show <parent>` renders the edge — because that view is the whole point; and
+**G1d** asserts the refused `task add` created **no row at all**.
+
+Four mutation controls, all killed: copying `set-title`'s closed-row refusal reds
+section A; neutering the shared bare-number guard reds **both** section D
+(`set-parent`) and section G (`task add`), which is what proves it is one guard and
+not two; removing the cycle walk reds section C; and reverting the add path to a
+bare `resolve_task_id` reds section G alone.
+
+Knowledge compiled into the page this row came from:
+`community/wiki/a-split-out-row-with-no-parent-link-is-invisible-to-the-row-it-came-from.md`
+(Delta 2026-08-12), plus an index line in its new reader's words.
+
+## v0.19.14 — fix(host): the FORK telegram plugins are delivered, from a ref, and you can now read which version each one runs (DIVE-3269)
+
+The five fork plugins (codex/grok/agy/pi/opencode) load
+`/usr/local/lib/5dive/telegram-<rt>/server.ts` directly — `agent-codex`'s
+`config.toml` names that path, and `agent_setup.sh` resolves
+`TELEGRAM_<RT>_PLUGIN_DIR` → that dir → the shared checkout, so the staged copy
+always wins because it exists.
+
+**Nothing on the host wrote it.** Measured 2026-08-11: all five staged copies
+predated DIVE-3224 by an hour, with that row *and* DIVE-3267 both merged into the
+same dead end. Not a slow schedule — no schedule. `5dive-refresh-plugins.sh` and the
+23:15 host-update cron serve only the CLAUDE lineage, which loads a versioned
+marketplace cache; the forks are in neither mechanism.
+
+**And it was invisible.** "Merged" and "running" were indistinguishable from every
+surface, which is why this went unnoticed rather than unfixed — so the readout below
+is half the fix, not a nicety.
+
+### New: `5dive-stage-fork-plugins.sh`
+
+Called by `5dive-refresh-plugins.sh` (already on the 23:15 cron), so both lineages
+are delivered by one entry point and one `--restart` pass. A second cron entry would
+be a second thing to forget, and forgetting is this row's defect.
+
+Three decisions, made rather than assumed, because each has a wrong answer that looks
+reasonable — and two of them are only wrong in a situation that does not arise on a
+healthy day:
+
+1. **Stage from a REF, via a BARE mirror.** The obvious implementation reads the
+   shared checkout at `/home/claude/projects/5dive/5dive-plugins`, which that day sat
+   on `dive-1428-gap23-inline-clear` at ca36c73 — a stage step pointed there ships
+   whatever someone left checked out to every fork agent, unreviewed, and looks
+   healthy doing it. A bare mirror has no working tree to be parked, so the failure
+   mode is structurally absent rather than avoided by care. It also keeps root's hands
+   off an agent-writable checkout, where `sudo git` leaves root-owned objects and
+   breaks the next agent that writes there. The repo is public, so no credentials.
+2. **Never degrade to another source.** If the ref will not resolve, staging SKIPS,
+   loudly, leaving the previous copy in place. Stale-but-reviewed beats
+   fresh-but-unreviewed.
+3. **Overlay, do not replace.** The staged dirs carry `node_modules` the repo does
+   not; a clean-and-copy would leave every fork agent unable to start. `bun install`
+   re-runs only when the lockfile actually moves.
+
+Each staged dir gets a `.5dive-stage.json` manifest (plugin, ref, sha, staged_at,
+source) — **provenance, never the verdict**; see `--status` below. Fork agents whose
+plugin changed join the existing deferred-restart pass.
+
+**The install is per-file rename-into-place.** This runs as root out of the 23:15 cron
+and overwrites what five live agents execute, with nobody watching. Files are extracted
+to a temp dir and validated (archive extracted cleanly, `server.ts` present) before
+anything is touched, then copied beside each target and `mv`d over it — a reader sees
+the old inode or the new one, never a truncated `server.ts`. A part-way failure cleans
+up its scratch files and says so loudly, because "some files new, some old" is the one
+state a later run may not notice.
+
+### New: `--status`, the question nobody could ask
+
+`sudo 5dive-refresh-plugins.sh --status` (or the staging script directly) prints each
+fork as **CURRENT**, **BEHIND `<sha>`**, **MODIFIED** (matches no ref — hand-edited,
+half-installed, or staged before this existed), or **UNKNOWN** when upstream is
+unreachable. Never a comparison it could not take — same posture as
+`ops/in-my-binary.sh`.
+
+**The verdict is hashed from the bytes on disk, not read from the manifest**, and that
+distinction is the row itself. A status verb that reports the version from a file the
+stage step wrote can only confirm THE STAGER RAN — it agrees with the writer by
+construction, which is "merged and running are indistinguishable" reproduced one layer
+up inside the fix for it. So every file the ref carries is hashed with `git hash-object`
+and compared to the blob id in the ref's tree. A hand-patched `server.ts` reads MODIFIED
+even though its manifest still names the current sha — and that is not hypothetical: the
+box carries a `server.ts.bak-dive3179-*` beside a staged plugin right now.
+
+### Not done here, deliberately
+
+The checkout fallback in `agent_setup.sh` is provably never-firing on a staged box and
+reads like a safety net it is not. It stays for now: it is on the agent-create path
+whose smoke cannot run on this host (DIVE-2847), and removing a net in the same change
+that first makes the primary self-maintaining is two changes wearing one hat.
+Recommended as its own row.
+
+### Tests
+
+New `tests/refresh_plugins_fork_stage_unit.sh` — 19 arms, 0.89s (min of 3 on this box; core tier), all green.
+It exercises the real script against temp dirs via the `FORK_*` env overrides, which
+is why the staging lives in its own file: `5dive-refresh-plugins.sh` refuses without a
+claude binary and enumerates real agents at load, so its fork half could only ever
+have been tested by delivering. **A delivery mechanism testable only by delivering is
+the shape this row exists to end.**
+
+The arms grade the decisions, not the plumbing: **S7** parks the source repo on a
+branch carrying poison *and* dirties its working tree, then asserts the staged bytes
+are still main's; **S6** points at a ref that cannot resolve and asserts the previous
+copy is untouched; **S5** plants a `node_modules` marker and asserts it survives a
+re-stage; **S2** asserts the claude-lineage `telegram` in the same `plugins/` dir is
+never staged, since staging it would overwrite a marketplace-managed tree.
+
+**R5** stages cleanly, then hand-edits the staged `server.ts` the way someone patching a
+live box does, and asserts the verdict moves off CURRENT — the arm that fails if
+`--status` ever goes back to trusting the manifest.
+
+Two mutation controls, because arms this shape pass for the wrong reason easily: pointed
+at the parked ref on purpose, the same script stages the poison (so **S7** passes because
+the implementation reads a ref, not because the mechanism cannot get it wrong); and with
+the content comparison forced to always-match, **R2/R3/R5/R5b** go red together (so they
+measure the hash, not the manifest).
+
+## v0.19.14 — feat(task): `ls --json` exports `needs_human`, the CLI's own verdict on whose gate it is (DIVE-3267)
+
+DIVE-3224 fixed the telegram plugin's `/inbox`, which filtered `task ls --json` on
+`need_type` — "has an unanswered gate", not "needs a HUMAN" — and showed lodar 12 gates
+of which 3 were his. Grading that merge, main found **the same wrong predicate still live
+one command over**: `/task`'s "🔔 Needs you" section, in all six plugin forks, with a
+comment above it asserting the false premise as its justification.
+
+Both copies existed for one reason, and it is this command's fault: **the real predicate
+was reachable only by re-deriving it.** `cmd_task_inbox` evaluates it and renders a view;
+any consumer that needed the *answer* for its own layout had to rebuild the *rule*.
+
+**So export the verdict.** `needs_human` is a computed boolean on `task ls --json`,
+evaluated from the same predicate `task inbox --json` uses. A consumer partitions on the
+answer in one call.
+
+That is not a loophole in DIVE-3224's prohibition, it is the prohibition's point.
+Forbidden: exporting the raw INPUTS (`routed_reviewer`, `needs_capability`) so a consumer
+can re-derive the rule — that is the second copy, and it drifts, which DIVE-3228 proved
+by landing a fourth clause the morning after DIVE-3224 was written. Exporting the RESULT
+is the opposite move: same single evaluation, one more view. `tier` (DIVE-3224) was the
+narrow version of this; `needs_human` is the general one.
+
+**The way to get this wrong is to paste the SQL into the `ls` query** — then the fix for
+two copies ships three. Both predicates are now single-source helpers,
+`_task_gate_open_pred` and `_task_human_gate_pred`, defined once above `cmd_task_inbox`
+and interpolated by both call sites. `gate_live` (DIVE-1347) now reads from the same
+open-predicate helper rather than restating it, closing a smaller instance of the same
+drift that was already in the tree.
+
+Deliberately **not** "have the consumer call `task inbox --json` too": two calls are two
+snapshots with a window between them, so a gate answered in that window lands a row in
+neither section or in both.
+
+New harness `tests/task_needs_human_parity_unit.sh` (18 arms). Its shape is the argument:
+
+- **P1** asserts `needs_human==1` is *exactly* the `inbox` ident set — and is worthless
+  alone, because parity between two views is trivially true on a fixture with no row they
+  could disagree about. So **P0** replays the pre-fix reading (`gate_live`) over the same
+  fixture and asserts it returns strictly more rows. The fixture seeds both sides of every
+  clause, including both sides of DIVE-3228's routed-`access` case.
+- **S1** asserts at source level that the disjunction is written exactly **once** in
+  `cmd_task.sh`, and **S2** that there is one definition and exactly two call sites. That
+  is the copy-paste failure caught mechanically rather than at the next founder complaint
+  — main graded DIVE-3224's merge by diffing the predicate byte-for-byte; this keeps that
+  check.
+- **F1** pins that `needs_human` is present and `0` (never omitted) on non-human rows.
+  That is load-bearing for the plugin, not for this CLI: a consumer on an older binary
+  sees the key absent *everywhere* and falls back to the old reading, which is only safe
+  because present-and-0 can never look like absent.
+
+Ships with 5dive-plugins DIVE-3267 (`/task` partitions on this field across all six forks).
+
+## v0.19.14 — fix(task): `inbox --json` exports `tier`, so /inbox stops showing the founder other people's gates (DIVE-3224)
+
+lodar, 2026-08-11, minutes apart: *"im frustrated some tech asks still go to human
+instead of agent main"* and *"what about 14 gates awaiting you … this still spams my
+inbox every time I press /inbox"*. The second is not the first one lingering. It is a
+separate defect on the display side, and it is one predicate.
+
+Measured that morning: `/inbox` listed **12 gates, 3 of them his** (DIVE-3172 a
+CODEOWNER click, DIVE-3150 an npm token, DIVE-3215 customer comms). The other 9 were
+routed to agent seats — dev, dev2, dev3, cli, main2, quinn — and **each carried a ✅
+apply-the-recommendation button**, so the surface was not merely noisy: it invited him
+to answer questions already addressed to somebody else. DIVE-2093's gate was routed to
+main2 and rendered in the founder's chat with a tap button on it.
+
+`cmd_task_inbox` has known the difference since DIVE-3117 part 2 (a gate with
+`routed_reviewer` set waits on an agent seat) and grew a fourth clause in DIVE-3228
+(a routed `access` gate its lead can now clear). **The telegram plugin never called
+it.** It shelled `task ls --json` and kept every row carrying a `need_type` — "has an
+unanswered gate", not "needs a human".
+
+The old comment says honestly why it drifted, and the reason is this command's fault:
+`inbox --json` withheld `tier`, which the ✅ button path needs to tell a soft gate from
+a hard one. So the plugin reached for a view that had `tier` and rebuilt the filter by
+hand, minus the routing half.
+
+**`tier` is now in the `inbox --json` SELECT** — one field, so the predicate above can
+stay the single copy. The fix deliberately does NOT export `routed_reviewer` /
+`needs_capability` for consumers to re-implement the rule with: that is what produced
+this bug, and DIVE-3228 is the proof it would have drifted again — a plugin-side copy
+written before it would have gone on showing the routed `access` gates it excludes.
+
+A NULL tier ships as an **absent key**, not `tier: null` (`dbfmt -json` omits nulls,
+and jq answers `null` for an absent path either way). Consumers must read both as 2 —
+visible, not auto-clearable — matching this view's own fail-safe direction: showing a
+human one gate too many is recoverable, hiding one is the defect.
+
+New harness `tests/task_inbox_json_tier_unit.sh` (14 arms). Two are armed controls,
+because the obvious versions of these arms pass against a broken build: **T2** asserts
+`tier` reads back per-row rather than as a constant (a uniform `tier: null` would
+satisfy a mere presence check and then hand the consumer's unknown-tier fail-safe the
+entire fleet), and **R0** reproduces the pre-fix `need_type`-only read and shows the
+routed gates DO come back — without it, R4/R5 would be green against a filter that
+never ran.
+
+Plugin side ships separately (5dive-plugins): `/inbox` now sources this view and its
+local filter is deleted. On a host whose CLI predates this change `tier` is simply
+absent, every gate reads as 2, and they route through the `inbox --send` nonce digest —
+fewer inline buttons, never an unreachable gate.
+
+## v0.19.14 — feat(host): `5dive host` — hardened host-remediation verbs under the CLI-root grant an admin agent already holds (DIVE-3221)
+
+A devops seat provisioned at the **highest** isolation tier (`admin`) has full **detection** of the
+box and zero **remediation**: `systemctl show` is unprivileged, so it can read every unit's
+`WorkingDirectory` and `Result`, while `daemon-reload`, writes under `/etc/systemd/system` and
+another user's crontab are all denied. That is the wrong half. lodar found dead `Type=oneshot`
+backup jobs by looking at a screen; the finding was never the hard part.
+
+DIVE-3213 proposed closing it with a fourth isolation tier scoped to `systemctl` + `daemon-reload` +
+`/etc/systemd/system` + `crontab` + `journalctl`. **Each of those four is an independent one-line
+root escape, and three were already on `write_admin_sudoers`'s deliberately-excluded list** (the
+DIVE-1088/2079 comment block): `journalctl` and `systemctl status` page through `less` → `!sh`;
+writing a unit file and reloading is `systemd-run` spelled slowly. The tier would have read
+`host-admin` in `agent info` and meant `root-all`. lodar answered **B**: no tier — build the verbs.
+
+An `admin` agent's grant is `/usr/local/bin/5dive, /usr/local/bin/5dive *`. The trailing `*` covers
+**subcommands that do not exist yet** — measured as the seat, not read off the drop-in:
+`sudo -u agent-ops sudo -n /usr/local/bin/5dive host unit list` returns the CLI's own
+`unknown command: host`, while `sudo -n systemctl daemon-reload` from the same seat returns
+`a password is required`. So these verbs ship remediation with **no sudoers change, no new tier, and
+nothing for the next `agent create` to silently revert** — which was the whole objection to
+hand-editing a drop-in.
+
+```
+5dive host unit list [--pattern=<unit-glob>]
+5dive host unit show --unit=<unit>
+5dive host unit repoint --unit=<u>.service --workdir=<abs-path> [--no-restart]
+5dive host unit revert  --unit=<u>.service [--no-restart]
+5dive host journal --unit=<unit> [--lines=N] [--since=<N>m|<N>h|<N>d]
+5dive host cron show|snapshot|diff --user=<user>
+```
+
+Every verb takes **structured, validated parameters only** — no unit-file content, no shell string,
+no editor, no caller-supplied file path. `repoint` writes one drop-in of fixed shape
+(`<unit>.d/50-5dive-workdir.conf`, one `[Service]` section, one `WorkingDirectory=` line);
+`revert` removes exactly that basename. `crontab` is read-only (`-l -u` only): `crontab -e` for
+another user is an `EDITOR=/bin/sh` escape, and if the target is `claude` that seat is
+`NOPASSWD: ALL`. `--since` is a structured `<N>m|h|d` pair mapped to one of three literal phrases,
+because `journalctl`'s own time grammar is caller text reaching a root process's argv.
+
+**`repoint` refuses a unit that runs as root, and that refusal is the design.** A unit's
+`WorkingDirectory` *is* a code pointer whenever its `ExecStart` carries a relative argument —
+`5dive-api.service` runs `node dist/index.js`, resolved against the cwd. Repointing a root unit at a
+caller-chosen directory is "exec agent-controlled input as root" with two extra steps, which is the
+one thing that turns `cli-root` into `root-all` for **every** admin agent on the box at once. An
+empty `User=` lands on the same branch as the literal `root`, since that is systemd's default. Every
+unit the devops charter named runs non-root (`5dive-api`/`5dive-frontend` as `claude`,
+`5dive-discord-welcome` as `agent-marketing`), so the refusal costs the driver case nothing.
+
+The pager escape that DIVE-1088 excluded those grants *for* is closed **in code**, not by
+convention: all `systemctl`/`journalctl` calls route through two wrappers that pass `--no-pager` and
+pin `SYSTEMD_PAGER`/`PAGER=cat` while dropping `LESSOPEN`, so an inherited environment cannot
+reintroduce it. `tests/host_verbs_unit.sh` pins both the value refusals and the *structural* ones —
+no `eval`, no `sh -c`, no editor, no `crontab` verb but `-l -u`, no raw `systemctl`/`journalctl`
+outside the wrappers — because a value assertion cannot see a new verb someone adds next year.
+
+## v0.19.14 — fix(heartbeat): the nudge counter now forces a state change instead of logging one (DIVE-3218)
+
+`_hb_mark_run` has incremented and echoed a per-task nudge count since DIVE-1486 "so
+the caller can decide whether the task is being starved". No caller decided. The one
+that read it — the `_HB_STARVE_AFTER` branch — wrote a WARN to the tick log, bumped a
+`starved` tally, and changed nothing.
+
+Measured 2026-08-11: dev3 was woken about ONE urgent row (DIVE-2896, filed with
+lodar's words "the fleet's most urgent priority") **173 times over 3.5 days** with
+zero state change. Every wake was a full fresh-context opus session that re-read the
+same stale in-row note, re-derived the same "wait" conclusion, and exited with no
+memory that it had done so 172 times already. The counter was correct throughout.
+Correct detection wired to no lever is the whole defect —
+`community/wiki/a-nudge-counter-nobody-consumes-is-detection-not-enforcement.md`.
+
+A two-rung ladder now **consumes** that count, modelled on the DIVE-2853
+recurring-stall ladder rather than built as a parallel one. The two cannot see each
+other's rows: 2853 keys on hours since materialisation for a beat whose later slots
+skip-if-open is eating; this keys on the count of fruitless wakes for any standard
+row.
+
+- **Rung 1, at N**: escalate once (existing `task escalate` semantics) **and append a
+  dated line to the row body**. The body write-back is the load-bearing half, not the
+  bookkeeping: a fresh-context seat's only memory of its own past wakes is what the
+  row says, so a state change made silently relocates the re-deliberation instead of
+  ending it. The note tells the next seat to write down a decision *not* to start.
+- **Rung 2, a further N wakes later**: change hands — reassign to a free agent in the
+  same org lane, never the current assignee (handing the row back to the party whose
+  non-pickup *is* the fault is the no-op the rung exists to stop) and never the row's
+  own verifier (DIVE-3097). If nobody is free, **park with a wake date**. Again with
+  an in-row write-back.
+- **Never cancel.** This is the deliberate divergence from DIVE-2853, whose fallback
+  *is* a cancel: an open recurring instance suppresses every later slot of its beat,
+  so leaving it open is an ongoing outage. A standard row suppresses nothing — it is
+  merely starved, and a starved row is not an unwanted row.
+
+**Rung 2 keys on `nudge_escalated_n + N`, never on a recomputed `2N`.** Rung 1
+escalates, escalation raises the priority band, and a higher band carries a *smaller*
+N — so a row escalated at the `high` threshold of 16 is already past an `urgent` 2N of
+16, and both rungs fire on the same wake. The new harness found this before it
+shipped; the stored count makes rung 2 mean "a further full threshold of fruitless
+wakes after we escalated and said so", which is immune to the band moving underneath
+it. Rung 2 is also never a first contact: a row inherited at 173 nudges takes rung 1
+first, so its hands never change without a written explanation already in the body.
+
+Thresholds are **per priority band** — the burn per wasted wake is identical across
+bands but the tolerable latency is not — and they count nudges, not hours, because the
+count *is* the burn. Defaults 8 / 16 / 32 / 64 (urgent / high / medium / low), roughly
+2h / 4h / 8h / 16h to rung 1 at the common 15-minute cadence. Overridable at
+`.config.heartbeat.nudgeEnforceAfter.<band>` in the registry, so N moves with cadence
+and roster size without a release cut. A missing, non-numeric or zero value falls back
+to the compiled default and **never disables the ladder** — an unreadable config
+silently restoring the 173-wake world is the exact failure this ends.
+
+`_HB_STARVE_AFTER` is untouched: it stays a cheap n>=3 log observation feeding the
+`starved` tally in the tick summary. Its only readers are that summary line and its
+JSON, both in `cmd_heartbeat.sh`, and neither changes here.
+
+New columns `nudge_escalated_at`, `nudge_escalated_n`, `nudge_parked_at` (tasks, 79 ->
+82). Both rungs latch once per row, so a reassignment cannot thrash a row around the
+fleet. New harness `tests/heartbeat_nudge_enforce_unit.sh` (32 arms, TIER core),
+including a source-level assertion that the tick path actually calls the ladder —
+delete the call site and every behavioural arm still passes, which is precisely the
+shape of the bug being fixed.
+
+## v0.19.14 — change(agent create): the grok freeze now unfreezes on a managed-fleet MARKER, not an env var (DIVE-3185)
+
+`5dive agent create --type=grok` has been frozen since DIVE-1221/1222 over an
+unpatched codebase-exfiltration path in xAI's Grok Build CLI. The owner recorded
+a risk acceptance (2026-08-10) covering managed customer boxes, so the freeze
+needs a way to be armed on those boxes and nowhere else.
+
+The predicate moved from `FIVE_GROK_UNFREEZE_VERIFIED=1` to the presence of
+`/etc/5dive/arm/grok-unfreeze`, a marker written by 5dive provisioning.
+
+**The default is unchanged and still REFUSE.** If you installed the CLI
+yourself, your box has no marker and grok provisioning stays frozen exactly as
+before — this release does not unfreeze anything for OSS installers. That is the
+point of the change: a bundle-versioned relaxation with no predicate would have
+unfrozen grok for everyone who installs the tag, which is broader than the
+decision it implements.
+
+An env var pushed to boxes was the other candidate and was rejected: reversing
+it requires knowing which boxes carry it, and a line in `/etc/environment` gives
+no inventory, no diff, and no rollback that is not a second sweep. A release
+gives all three.
+
+The marker is a speed bump, not a security boundary — `agent create` is
+root-gated, so anyone who can write the marker could already have patched the
+guard out of a public repo. It buys deliberateness, not enforcement.
+
+To un-arm, remove the marker (the guard keys on presence, so `=0` does nothing).
+Note that this gates CREATE, not RUN: already-provisioned grok agents keep
+running, so "revocable" does not mean "recallable".
+
+## v0.19.14 — fix(release): release notes describe THIS cut instead of re-advertising every previous one (DIVE-3170)
+
+Four consecutive releases (v0.19.11 through v0.19.14) shipped a byte-identical
+`### Features` block. The generator was not dead — the notes ACCUMULATED. A cut
+makes two commits (assign, then bundle) and the tag names the second, so the
+`"${incumbent}^"` that three separate sites used as "main's tip as of the last
+cut" was really the ASSIGN commit: a release tree whose `changelog.d/` the fold
+had already emptied. Every already-shipped fragment therefore looked unshipped
+and re-folded on every cut.
+
+The tag-to-cut-point rule now lives in one place, `scripts/release-cut-baseline.sh`,
+which walks first-parent to the first ancestor of main and so does not care how
+many commits a cut stacks. The main-moved check, the fold baseline and the
+release-notes range all read it.
+
+## v0.19.14 — fix(task): a lead seat can now SIGN the gate it is allowed to CLEAR (DIVE-3160)
+
+A cli-scoped lead could CLEAR a gate it could not SIGN. `cmd_task_answer` signs the
+DIVE-756 closure in-process only at EUID 0; every other caller shells out to `sudo -n
+5dive gate-proof sign`, which a cli-scoped seat holds no grant for. Signing is
+best-effort by design, so the answer landed UNSIGNED, and `require_sig=1` on the push
+and deploy root executors refused it later — on the MAKER's next round-trip, with a
+message about tampering, and with no override flag on that path. Standing to clear and
+capability to sign were decided in two different places and nothing lined them up.
+Measured A/B on two seats, same command, same hour (DIVE-2159 vs DIVE-3088).
+
+New hidden root primitive `5dive _task_answer`, granted to every standard agent by
+`render_standard_sudoers` (exact command path, parameters over stdin, no wildcard).
+`5dive task answer` reaches for it automatically on a seat that cannot sign directly,
+so nothing changes at the keystroke; a seat that can sign keeps today's path byte for
+byte, and any refusal falls through to the existing behaviour — this can make a closure
+signed and can never make an answer fail.
+
+**Why it does not simply seal the stored row.** That reading looks safer than signing
+stdin and is not: `/var/lib/5dive/tasks/tasks.db` is `rw-rw---- root:claude` and every
+agent seat is in group `claude`, so a caller writes `need_answered_by='human:lodar'`
+with plain sqlite3 first and then asks for the seal. `tasks_db.sh`'s own note — *a
+raw-sqlite write that never ran cmd_task_answer leaves an unsigned/invalid row that
+gate-proof verify flags* — is the reason the HMAC exists at all. Narrowing the argument
+(stdin to ident) changes the transport, never the trust. So the primitive signs at
+ANSWER time, from facts it establishes itself: EUID 0 or refuse; the caller from
+`SUDO_UID` under sudo's `env_reset`, never argv; lead-clear standing re-derived AS ROOT
+from the task row; every human-evidence flag refused, with `human=0` forced again inside
+`cmd_task_answer` so a flag added later cannot reopen the DIVE-916/1115/2224
+forged-human residual. A maker may not have its own gate signed — keyed on
+`maker_agent`, never `assignee`, because on the acceptance row for this ticket the
+assignee IS the verifier and an assignee-keyed check would refuse the one legitimate
+clear it exists to make signable.
+
+Every check is a subset guard that refuses earlier; the primitive grants nothing and
+cannot widen who may clear what.
+
+## v0.19.14 — fix(bug): refuse to file a public issue with no description (DIVE-3136)
+
+`5dive bug --file` opened two PUBLIC issues on `5dive-ai/5dive` (#526 2026-08-07, #553
+2026-08-10) whose "What happened" section was still the issue template's own HTML
+comment. Every other field was there — CLI version, OS, bash, install method, selfcheck
+probes — so the one field that would let anyone act on the report was the one field that
+was empty. lodar found them himself; on a list measured at 8 open issues (DIVE-2794),
+two content-free bot issues are a visible fraction of the shop window.
+
+**Why "remind the caller" was never the fix.** `5dive bug` is invoked from an error
+path, usually by an agent, non-interactively — the suggestion to run it is printed BY
+the failure. There is nobody at a prompt to fill a placeholder in. A template that
+depends on a human finishing it is guaranteed to ship unfinished on exactly the path it
+was designed for.
+
+So the placeholder is **deleted from the source** rather than defaulted — nothing in
+`cmd_bug.sh` can emit it, and a harness arm greps the file itself to keep it that way.
+`--what=<text>` is now **required to `--file`**: a TTY is prompted, and a non-interactive
+caller is REFUSED with `E_USAGE` naming the flag. The refusal is satisfiable without a
+human, which is the whole negative arm — a guard that could only be satisfied
+interactively would just convert filed-but-empty into not-filed.
+
+**The description is captured where the CLI already knows it.** `fail()`'s
+E_GENERIC hint now PREFILLS `--what` with the error text it is printing anyway, so #553
+would have read *"accepts at most 1 arg(s), received 2"* — the DIVE-3135 defect would
+have been obvious on 08-07 instead of found by a human on 08-10. `--argv=<line>` carries
+the failing invocation, redacted with the same sensitive-flag rule `audit_log` applies.
+
+**Two guards, in the order that lets both fire.** `_bug_redact_argv` absorbs
+`--token=`-shaped values; `_bug_secret_scan` then REFUSES a token-shaped string that
+SURVIVED redaction. Scanning the raw argv instead — the first cut of this change — made
+the refusal swallow every case the redaction existed for and handed the caller a dead
+end where the design promised a fix. Only grading through the BUILT bundle showed it:
+both components were correct in isolation, which is the DIVE-3135 lesson applied to its
+own follow-up.
+
+**The hint had to be made inert before it could be useful.** Prefilling `--what` puts
+caller-influenced text (`fail "unknown flag: $1"`) inside DOUBLE quotes in a command
+printed for a human to paste, and double quotes do not suppress `$(...)` or backticks.
+Stripping only the quotes left a live injection against the one reader who trusts the
+tool enough to paste its own suggestion. `$`, backtick and `\` are stripped alongside
+the quotes; the unmodified error text is still printed verbatim one line above, so the
+copyable copy loses nothing by being inert.
+
+Scope note: this row is the REPORTING path. The `5dive gh` argv defect that caused both
+issues is DIVE-3135. Bot reports stay public and unlabelled deliberately — the measured
+damage was emptiness, not publicity, and a `--label` absent from the repo would break
+filing outright.
+
+## v0.19.14 — fix(agent): refuse an openclaw BYO create that would write a key with no model pin (DIVE-3130)
+
+`agent create --type=openclaw --provider=zai` reported success, booted a seat that
+`agent list` showed as `AUTH ok`, and then failed **every** message with *"auth or
+provider access failed for openai"*. `OPENCLAW_PROVIDER_MODEL` has no `zai` row, so
+with no `--model` the resolved model was empty, no `agents.defaults.model.primary`
+was written, and openclaw fell back to its built-in default — whose first path
+segment picks the provider *and* the credential, so the seat authenticated as
+openai with no openai key.
+
+DIVE-3113's precondition could not catch this: it is guarded by `[[ -n "$model" ]]`,
+so it fails closed on a *wrong* model id and cannot fire at all on an *absent* one.
+A key with no model pin is now a refusal for **every** provider, before anything is
+written — which also closes the same hole on `minimax`, `qwen` and `huggingface`.
+The message names the remedy (`--model=<id>`) and the oracle to grade the id with
+(`openclaw models list --provider <native> --plain`).
+
+`zai` is **kept** as an openclaw BYO option rather than dropped. openclaw
+2026.7.1-2 enumerates no `zai/` models, but an unenumerated namespace is a
+NO-ORACLE state, not proof that the provider is unroutable, and the DIVE-1826
+coding-endpoint pin still applies — so a zai seat now requires an explicit
+`--model` instead of silently producing a 401 seat.
+
+## v0.19.14 — fix(task): a tier-2 button tap now names the HUMAN who tapped, not the bot that relayed it (DIVE-3128)
+
+`need_answered_by` is the one field whose entire job is to prove a human was in the loop on a
+tier-2 gate. It did not do that job. The stamp was built as `human:$(task_actor …)` — the
+`human:` prefix pasted onto the identity of the PROCESS that ran `task answer` — and on the
+Telegram tap path that process is a bot. So a gate delivered through an agent's bot and tapped
+by a person landed as `need_answered_by='human:<that agent's name>'`, indistinguishable from
+the agent clearing its own human gate (the DIVE-3045 record, whose `need_answered_uid` belonged
+to an agent account). Nothing was forged; it is the honest output of asking the wrong question.
+
+Three changes:
+
+- **The tapper is stamped.** `task answer` takes `--tap-uid=`, `--tap-username=`, `--tap-msg=`
+  and `--relay-agent=`. The team-bot listener forwards them straight off Telegram's
+  `callback_query.from`, which the relaying agent does not choose. The uid resolves through
+  `${STATE_DIR}/humans.json`, then the Telegram handle on the same callback, then `tg:<uid>` —
+  an honest partial identity. There is deliberately no rung that falls back to the relay's
+  name; that rung is the bug.
+- **The relay is recorded separately, not folded in.** New `need_answered_relay` and
+  `need_answered_tap_uid` columns. `need_answered_by` says who decided; `need_answered_relay`
+  says whose bot carried it.
+- **A `human:` stamp may not name an agent.** Checked on every human stamp, not just the tap
+  path: if the name is one the roster measures as an agent, the claim is refused and stored as
+  `unattributed:<name>`, with a warning and an audit row naming the reason. The answer itself
+  still lands — what is refused is the claim, not the decision — and because the value no
+  longer starts with `human:`, every consumer that counts human touches (`cmd_trace`,
+  `cmd_digest`, `cmd_proof`, the precedent engine) stops counting it with no change on their
+  side. A roster that cannot be READ is reported as unmeasured rather than silently waved
+  through.
+
+A button tap is also now auditable from the record alone: `${STATE_DIR}/gate-taps.jsonl` logs
+the tapping uid, handle, message id, gate, relay, resolved human, stamp, whether a per-gate
+nonce was presented, and the verdict. The raw nonce is never written — only whether one was.
+
+**Note for relays outside this repo:** until a bridge forwards `--tap-uid`, its taps stamp
+`unattributed:<agent>` instead of `human:<agent>`. That is the intended, loud consequence — the
+old value was a claim the record could not support.
+
+## v0.19.14 — fix(test): refuse sudo when PAM restores host `FIVE_*` policy (DIVE-3096)
+
+`tests/lib/env_isolation.sh` cleared inherited `FIVE_*` variables in the harness shell, but
+`sudo` opened a PAM session that read `/etc/environment` and restored them before privileged
+code ran. A harness could therefore announce that it was isolated while grading host policy.
+
+The shared isolation seam now detects the exact configuration pair — a host `FIVE_*` entry
+plus an active sudo `pam_env` rule that reads `/etc/environment` — and refuses the sudo call
+before privileged code executes. It does not edit host policy or sweep customer boxes
+(DIVE-3092), and it does not rewrite sudo argv, which would break exact-path sudoers grants.
+
+`env_isolation_sudo_unit.sh` carries both positive controls: a clean environment with active
+`pam_env` forwards the original argv byte-for-byte, and a host knob with PAM pointed at a
+different file also passes. Only the conjunction refuses. Disabling the real guard installation
+turns the two DIVE-3096 arms red while both controls stay green.
+
+## v0.19.14 — perf(account): `account list` stops forking a jq per account, per type and per dedup probe (DIVE-3088)
+
+`5dive account list --json` is what the telegram plugin's `/account` runs, and on
+slow VMs it was measured at ~3.12s against the plugin's 3000ms budget — so the
+child was killed *before it printed*, `e.stdout` came back empty, and the
+DIVE-125 salvage-nonzero-exit hardening had nothing to salvage. Same
+"Failed to list accounts" string as the bug DIVE-125 fixed, different failure
+mode, which is why it read like a regression.
+
+The cost was spawn count, and it **grew with the fleet**: the row accumulator
+re-serialized the whole JSON array through a fresh `jq` on every account, the
+signins accumulator did the same per authed type, `account_types_authed` ran a
+`jq -e` membership probe per dedup check, and `account_agents_bound` re-read and
+re-parsed the entire registry once per account.
+
+Now each account contributes one tab-separated record built with shell builtins
+only, and a single `jq` pass assembles every row — joining the bound-agent index
+from ONE registry read. `account_types_authed` accumulates into a bash array and
+serializes once; its array-producing half is exposed as `account_types_authed_arr`
+so `cmd_account_list` consumes the type list directly instead of serializing to
+JSON and immediately re-parsing it.
+
+Measured on a 22-account host, before → after: **110 → 22 jq spawns**, 285 → 176
+total `execve`, **1777ms → 1118ms** mean of 6. Output is byte-identical in both
+`--json` and table mode on the same 22 accounts.
+
+The remaining per-account spawns are `account_signin_detail`'s, and only for types
+that are actually signed in.
+
+## v0.19.14 — feat(doctor): `5dive doctor --caps` answers "can THIS seat read GitHub" without guessing (DIVE-3076)
+
+On DIVE-3017 a seat declined to grade two items because it had no authenticated remote
+path. Three true observations, one false conclusion: `sudo -u claude gh auth status` is
+logged in — on **four of nine seats**. Two seats spent a round trip each on a capability
+question, and a verifier nearly handed a grade back to the maker, which is precisely what
+the independence rule exists to prevent.
+
+A wiki page cannot close that, because the failure is *an agent forming a false belief
+about its own capability*: a page only reaches the agent who thinks to look, and the whole
+defect is believing there is nothing to look up. So the answer is derived, per seat, by a
+command the seat already runs.
+
+`5dive doctor --caps` (= `--category=caps`) prints two lines:
+
+```
+── capabilities (per-seat report, not checks) ──
+  seat          dev2 (sudo grant cli-root, runas root)
+  github:read   NO  this seat's sudo grant is cli-root: root only, not arbitrary uids —
+                    there is no `sudo -u claude` path from here, and no password will make
+                    one. Route the read to a seat with runas=any (…).
+  github:write  NO  push identity is per-seat and the claude-uid borrow is RETIRED for the
+                    push class (DIVE-3017) — this report is NOT permission to reopen it.
+```
+
+`github:read` needs **both** arms and says which one failed: the seat's measured
+`sudo.runas` (already carried by `agent_sudo_grant` — it predicted all nine live seats with
+zero misses, and no second measurement was built) **and** a live `sudo -u claude gh auth
+status`, because a permitted uid switch says nothing about whether that token is still
+valid or still scoped. Account and scopes are read off the live call, never off a cached
+string. Roughly half the seats on a box have no path at all, so a `NO` always names its
+reason — a bare NO sends the reader hunting for a password that does not exist.
+
+It rides in `data.capabilities` **alongside** the checks, never inside them (the DIVE-2328
+lesson): the dashboard renders `severity == "ok"` as a passed check in green, and
+`github:write NO` is a correct, permanent, by-design state on every seat. As a passing check
+it would assert a health nobody claimed; as a `warn` it would light up half the fleet
+forever for being configured the way it is meant to be. The one genuinely check-shaped
+state — the uid switch is permitted but the token is dead — does file a `warn`, because
+then the fleet's documented CI-read route is advertised and broken.
+
+Known limits, written down rather than smoothed: a `cli-scoped` seat cannot run `5dive
+doctor` at all, so it cannot reach its own answer here; and the probe reports the
+capability, not the wisdom of using it.
+
+## v0.19.14 — fix(ui): `--once` returns the exit code it earned, cleans up after itself, and finishes writing the response (DIVE-2813)
+
+Two independent defects in `5dive ui --once`, filed as one and repaired as two. They are ~600 lines
+apart, in different languages, and fixing either alone leaves the other exactly where it was.
+
+**A trailing `kill` ate the cleanup behind it.** `wait "$py"` returns *because the child is already
+reaped*, so the belt-and-braces `kill "$py" 2>/dev/null` on the next line could only ever get
+`ESRCH`. Under `set -e` that ends the function there: it published **1 as the exit code of a fully
+successful run**, discarded the `rc` the five lines above had computed, and never reached the
+`rm -rf "$tmp"` — leaking a mode-700 temp dir on **every** invocation (115 already present on this
+host when it was measured). Deterministic: rc=1 on 12/12 bundle runs, rc=0 on 10/10 for the same
+python extracted standalone, so the interpreter was never involved.
+
+The bitter part is in the source's own comment. The author explicitly declined a `RETURN` trap in
+favour of *"explicit removal on every exit path"* — for a correct reason — but `set -e` is precisely
+the mechanism that skips explicit cleanup and preserves trap cleanup. The `INT`/`TERM` trap two lines
+up removed the temp dir; the explicit line chosen to replace it did not. Which is also why nobody
+reproduced the leak: the fall-through cleanup is reached **only** on the runs that served their
+request, so the leak happens on the successes and never on the Ctrl-C'd run anyone tries first.
+Generally: **a command whose success depends on the failure path having been taken will fail on the
+success path** — `rmdir` on a dir the good path already removed, `grep` on output a clean run leaves
+empty, `pkill -f` for a pattern that only matches a crash.
+
+**`--once` is no longer served by a threading server.** `ThreadingHTTPServer.handle_request()`
+returns on **dispatch**, not on completion — the main thread fell through to `server_close()` and
+exited, and interpreter shutdown killed the worker mid-write. Its threads are daemonic and
+socketserver's join-on-close list only ever tracks *non-daemon* threads, so nothing waited for the
+body. The dominant signature is not a refused connection: it is a **truncated 200**, status line and
+headers delivered, body cut. Measured on the pre-fix bundle, 14 runs: **10 answered `200` and then
+raised `IncompleteRead` on the body**, 3 dropped the connection, 1 was clean. Served in-thread,
+`handle_request()` cannot return before the response is on the socket. `serve_forever()` keeps
+threading — there a slow `/api/state` (it shells out to the bundle) would block every other request.
+`--once` also sends `Connection: close`, because under HTTP/1.1 the handler otherwise loops on a
+kept-alive socket and the single-shot server never returns.
+
+**Arm 15 of `tests/ui_views_e2e.sh` graded a status code and a dead process**, which is how a
+documented flag whose success path returned failure survived for as long as the flag has existed.
+Both new assertions are needed and neither substitutes for the other: **the exit code** (visible half
+of the first defect) and **the temp dir being gone** (the half no exit-code assertion can see — fix
+only the code and the leak ships), plus **the body against the `Content-Length` the server itself
+promised**, since a status-only assertion scores the truncated case as a pass — measured above at 10
+of 14. Status and body are read separately on purpose, so a truncated 200 fails the body check while
+still passing the status check and the arm can say which defect it caught. Readiness now comes from
+the server's own `listening on` line rather than a TCP connect, because `--once` has exactly one
+request to give and a connect-based probe spends it. Mutation-graded per finding: reverting the
+`kill` fix fails exactly the two cleanup assertions and no others; reverting the threading fix fails
+the body assertions on 8 of 10 runs, 5 of them behind a passing `200`.
+
+**Serving in-thread inherits a hang, so `--once` now has a 30s read timeout.** The threaded
+server exited immediately on a client that connects and never sends a request line — but it did
+that by *abandoning* it, which is the defect above. Single-shot there is nothing else running to
+notice, and the one thread would park in `readline()` forever. Measured on paired arms differing
+by that line alone: without it the server was still parked at 46s and had to be killed; with it,
+it exited at ~31s. `serve_forever()` keeps the stdlib default (`None`) — another thread is always
+available there, so the hazard is bounded and a cap would be wrong. The general shape:
+**a concurrency bug fixed by deleting the concurrency inherits every hazard the concurrency was
+masking**, and nothing regresses to catch it, because the masking was never a decision — it was a
+side effect of the bug. So it is graded: **arm 16** connects and sends nothing, and a refactor back
+to a threading server passes every other arm and fails only that one. The bound is overridable via
+`_5DIVE_UI_ONCE_READ_TIMEOUT` so the arm costs 2s rather than 30 (+3.0s on the file, 5.0s → 8.0s,
+min of 4 runs on this host). Mutation-graded: deleting the timeout line fails exactly arm 16's
+three assertions and no others. See
+`community/wiki/removing-the-concurrency-inherits-the-hang-it-was-masking.md`.
+
+## v0.19.14 — fix(task): rewriting a row's acceptance criteria is now recorded (DIVE-2812)
+
+`task verifier <id> <agent> --accept=<criteria>` is the only writer of `acceptance_criteria`
+on an existing row. It **replaced** the prior criterion and wrote nothing anywhere: measured
+**zero** `task verifier` rows in the fleet audit log, ever, against **1672** for its audited
+sibling `task set-body` (DIVE-1920, which carries actor/mode/prior_len for exactly this
+reason). So a maker could rewrite the bar they are graded against and leave no trace of who
+did it or what it used to say.
+
+That is also why the field read as **immutable** for months — DIVE-2812 was filed asking for a
+setter that already existed. A mutable value whose mutation leaves no trace is
+indistinguishable from an immutable one to everyone except the person who typed the command.
+
+The remedy is a **record of the edit, not a lock on the field** — a legitimate re-scope has to
+stay possible (an acceptance criterion naming a mechanism that was measured not to exist is its
+own defect), it just must not be silent:
+
+- an accept-write that MOVES the text emits `task verifier set-accept` with the actor, the
+  verifier, `prior_len`/`new_len`, a sha256 of the prior text and the **prior criterion itself**
+  (truncated past 2000 chars, with the hash of the untruncated original alongside), so the bar a
+  row was originally filed under stays recoverable by someone who was not there;
+- re-pointing a grader with no `--accept`, or passing back the identical criterion, writes
+  nothing — those are not edits to the bar, and a row for them would hide the real ones;
+- the command itself now says the criteria CHANGED and echoes the prior text
+  (`priorAcceptanceCriteria`, `acceptanceChanged` in JSON), for the one person who can still
+  catch a wrong overwrite while it is undoable.
+
+## v0.19.14 — feat(task): per-task token budgets are ENFORCED, default 5M (DIVE-2794)
+
+`task_budget` has been stored, validated and displayed since DIVE-824 and read by **nothing**.
+It looked like a control and was a label. This makes it halt.
+
+**Why a third guard when two already exist.** The two that can halt cannot see the burn:
+the per-AGENT cost budget is a rolling-24h total across everything a seat does (and its hard
+stop is opt-in, because killing a whole agent over one row is disproportionate), and the
+per-LOOP ceiling is already hard (DIVE-972 + OSS-24) but only sees work that IS a loop. The
+two worst measured rows were neither: **DIVE-2814 was 27% of one fleet day** with no loop
+anywhere near it, and **DIVE-3045 burned 19.1M tokens in 24h on a LOW-priority row** blocked
+on a credential nobody was provisioning. A per-loop ceiling would have capped neither. A
+per-task budget caps both.
+
+**Why a number and not better judgement.** DIVE-2814 was reasoning toward a customer box we
+are forbidden to SSH into, so it had no inspectable object and therefore no natural stopping
+condition. It was unbounded BY CONSTRUCTION, not by carelessness, and no amount of care caps
+an open-ended loop.
+
+**Shape: park, never kill.** A breach sets `blocked` + `parked_at` + `park_reason` — the same
+shape as `task park` — and the heartbeat work-picker only dispatches `status='todo'`, so a
+parked row is structurally excluded from the next round and the spend stops. The work is
+intact and one `task unpark` away. Same proportionality call as OSS-24: halt the ROW, never
+the agent, which would take down that seat's unrelated work.
+
+**Tier-1, not tier-0, and the losing option is recorded because it is the one a future reader
+will re-pick.** A tier-0 gate applies its own recommendation immediately: the row would write
+a note explaining why it is continuing, and then continue. But a row with no natural stopping
+condition will always self-grant — that is the definition of the failure being capped — so
+tier-0 turns the cap into a speed bump with a receipt, which would be the fourth
+detection-shaped control on a board whose whole complaint is that every burn control we ship
+is detection. Tier-1 is lead-clearable, so it is still never a human tap in lodar's DM. The
+tier is a pref (`task_budget_gate_tier`), so dropping to tier-0 is a settings change.
+
+**The ask carries what decides it.** "DIVE-XXXX hit 5M, continue?" is unanswerable and becomes
+a rubber stamp inside a day. The gate carries the real spend, the budget, the priority and the
+row's age, so "5M on a LOW row running 19h" answers itself. `task_budget_trips` counts
+breaches from day one, so the tier-1-vs-tier-0 call gets re-decided on a measured rate rather
+than on irritation.
+
+**The incident carve-out, stated explicitly rather than discovered at 3am.** There is no
+implicit exemption, deliberately. `--customer` was the obvious candidate and **cannot** be
+used: it is an add-time classifier bypass that is never persisted, so nothing at sweep time
+can read it. Priority was rejected too — making `urgent` exempt just moves every runaway row
+to `urgent`. The escape is explicit and per-row (`--task-budget=none`) and, crucially,
+settable AFTER filing via the new **`5dive task set-budget <id> <tokens|$cost|none>`**, because
+the incident row at 3am was not filed by someone thinking about budgets. Unparking alone is
+NOT enough and is the trap `set-budget` closes: the sweep re-parks on the next tick unless the
+budget itself changed. The fleet kill switch is `task_budget_enforce=off`.
+
+**One spend reader, not two.** `_spend_scan_task_ids` is extracted from `_loop_refresh_spend`
+unchanged, so the per-task and per-loop guards measure tokens the same way. A second copy is
+how you get two guards that disagree about what a token is — the DIVE-2304 fail-open would
+have had to be found and fixed twice. That guard's rule is inherited by construction: a spend
+that could not be READ is NOT-REACHED, never 0, and a failed read never parks a row. Parking
+on an unreadable number is the same fail-open pointing the other way, and it would halt live
+work over a transient error.
+
+`tests/task_budget_enforce_unit.sh` — 26 arms. Every negative arm (the carve-out, the `$cost`
+variant, the kill switch, the unreadable spend) is paired with a positive control in the same
+pass, so a harness that silently stopped parking anything cannot pass. Neutering the sweep
+takes it to 13/13.
+
+## Arm two — a per-LANE WIP cap on the same mechanism
+
+Tokens cap what one row may SPEND; this caps how many rows a lane may HOLD. Same verb, same
+refusal path, same carve-out — two independent refusals on `task add` would disagree, print
+different remedies, and teach the fleet that a failed add is noise.
+
+**Counted: `todo` + `in_progress` only.** Not blocked, not parked, not recurring templates.
+The fleet holds 55 blocked rows; a cap counting them would be over on day one for every lane
+with no satisfiable path back under — the unsatisfiable-gate shape we have shipped once and
+had to unwind. A blocked row consumes no attention, and attention is the resource.
+
+**The cap is FROZEN, not tracking.** Initialised to a lane's own actionable count on first
+sight, then it moves only by a lead clear. A close lowers the COUNT, which is what creates
+headroom. The first spec had every close lower the CAP, and that is a lock rather than a
+ratchet: after each close actionable == cap again, so the next add refuses forever and the
+lane drains to zero and stops working. Caught in review before it was built, which is where
+it was cheapest to catch. Frozen keeps every property that was actually wanted —
+close-one-to-file-one, no lane can grow, nobody defends a magic N.
+
+**Materialization is exempt; filing is not.** Six internal writers reach `cmd_task_add`
+(`cmd_goal` ×2, `cmd_loop`, `cmd_loop_pack`, `cmd_objective`, `cmd_proof`). They turn ONE
+already-approved decision into N rows, so a cap firing halfway leaves a HALF-MATERIALIZED plan
+— some children exist, some do not, and a loop driver is already waiting on a child list that
+is short. That is a silent, undesigned state and strictly worse than an uncapped lane. They
+pass `--materialized`; the rows they create still COUNT, so the next HUMAN filing is refused.
+
+**Priority: lodar's rule kept verbatim, and extended only where it was silent.** He ruled
+2026-08-09 that only low and med get the hard refusal, because "a quota that can block a
+SERIOUS finding will eventually eat one". That stands. What it did not say, because nobody
+asked, is that a high/urgent row must go to the lane first named — so on a full lane those are
+**REDIRECTED, never refused**: the message names the lanes with headroom and
+`--assignee=<other>` succeeds immediately, so nothing is ever lost. And if EVERY lane is at
+cap the row **lands anyway**, uncapped, and trips the counter loudly — at that point the fleet
+is genuinely saturated and refusing a serious finding is the worse of the two failures. That
+branch existing is what lets the rest of the rule be strict. "Refuse" and "cannot grow this
+lane" are not the same operation, and only the first is what he ruled on.
+
+`wip_cap_trips` counts every trip including redirects and saturated landings, so whether the
+frozen cap wants a scheduled decay is answered by inflow data rather than by irritation. One
+carve-out, shared with arm one: `--task-budget=none` (and `task set-budget`). Fleet override
+`FIVE_WIP_CAP=0`.
+
+`tests/task_wip_cap_unit.sh` — 24 arms; neutering the cap takes it to 13/11. The load-bearing
+one is the anti-lock arm: close three rows, then successfully add one. Under the original
+"every close lowers the cap" rule that add is still refused, so it cannot pass by accident.
+
+---
+
+## CORRECTION, same day: "never a human tap in lodar's DM" was FALSE as shipped
+
+The paragraph above says tier-1 is lead-clearable "so it is still never a human tap in lodar's
+DM". The first live trip — DIVE-2057, ~40 minutes after the tag — was exactly that tap. The park,
+the state write and the gate all behaved; the tier defaulted to 1 correctly; and the **T2 category
+floor overrode it**, because the ask said `tokens` and `token` is on `_GATE_T2_FLOOR_RX`. There it
+almost always means an API credential. Here it is a unit of measure, and the classifier cannot tell
+those apart — so every budget trip was being filed as a *secrets* gate.
+
+Two causes, both in the ask's wording, both now fixed at source:
+
+1. **The unit.** `_hb_tok_scale` emits `21.0M` / `60k`. Identical to a human, invisible to the
+   credential classifier. The exact figures move to `park_reason`, which no classifier reads.
+2. **The row title no longer rides inside the ask.** DIVE-2224 answer A made the floor's subject
+   the ASK precisely so a ticket's DESCRIPTION could not be read as a REQUEST; quoting
+   `"${title}"` into the ask silently undid that for this one gate. Measured: with the unit
+   already fixed, a row titled "delete the stale webhook rows" still floor-hits on `delete`. So
+   fixing only the unit would have repaired DIVE-2057 and left every future trip on a row titled
+   delete/purge/dns/revoke/billing still paging the human.
+
+`_GATE_T2_FLOOR_RX` is **untouched** — `token` belongs on it for every other gate, and widening a
+safety control to unblock the thing it flags is the shape refused under DIVE-3175. `--discusses`
+(DIVE-2089) is the sanctioned appeal and was rejected for a reason worth keeping: it only fires
+once the floor already has, so it corrects a mis-filed gate instead of never mis-filing one.
+
+Two new arms in `tests/task_budget_enforce_unit.sh` run the REAL `_gate_tier2_floor_hit` over the
+ask the sweep actually emits — spied at the call site, not a copy of the string — each with a
+non-vacuity control. Mutation graded, with the mutation asserted to have applied: restoring the
+unit word reds 4 arms, quoting the title back in reds exactly 1. A comment is not a guard.
+
+## v0.19.14 — fix(agent): trust the agent's effective workdir so it never parks on the folder-trust dialog (DIVE-2743)
+
+`preseed_claude_agent()` writes exactly ONE trusted project into a new agent's
+`~/.claude.json`: `/home/claude/projects`. But a **sandboxed** agent's workdir defaults to
+`/home/agent-<name>`, and **any** agent created with `--workdir=<path outside the projects
+root>` lands elsewhere too — at every isolation tier, not just sandboxed. `tmux` launches
+claude with `-c "$WORKDIR"`, so those agents come up in a directory with no trust entry and
+park on the interactive *"Do you trust the files in this folder?"* dialog, which a headless
+agent cannot answer. It is the folder-trust half of the first-boot problem; the
+custom-API-key half was DIVE-1591, and this is the confound that muddied its probes.
+
+`5dive-agent-start` now seeds trust for the effective workdir before the launch.
+
+**Boot-time, not create-time.** A create-path fix would cover new agents and leave every
+already-stranded agent needing a recreate; at boot they back-fill for free on the next
+restart. It also sidesteps an ordering trap in the obvious patch: the create path calls
+`preseed_claude_agent` at `cmd_agent_create.sh:1752` and only defaults the sandboxed workdir
+at `:1885`, so threading `$workdir` through would pass an **empty string for exactly the
+sandboxed case** — a change that looks like a fix, changes nothing, and passes any harness
+that supplies an explicit `--workdir`. That patch is a graded mutant in the new harness.
+
+**The ticket assumed exact-match; the bundle does a parent walk.** Measured in the 2.1.222
+binary on this host, the trust check canonicalizes cwd and walks its parents:
+
+```js
+let n = canon(cwd);
+while (true) { if (config.projects?.[n]?.hasTrustDialogAccepted) return true;
+               let i = canon(resolve(n, "..")); if (i === n) break; n = i }
+return false;
+```
+
+That does **not** move the cause — `/home/agent-<name>` walks to `/home` then `/` and never
+meets the trusted root, so the reported stall is real. It moves the **skip condition**: a
+workdir at or *under* the root is already covered by the walk, so the seed skips it and the
+JSON stays clean. An equality-only skip would grow a redundant entry per project subdir
+forever; that is a graded mutant too.
+
+**Assert the field, not the key.** Claude Code creates the project entry *itself* on first
+visit with `hasTrustDialogAccepted: false` (the bundle's default project object), which is
+why a live probe saw the dialog re-arm on an agent whose config already carried the workdir
+key. So this is a **read-modify-write that merges the flag onto whatever entry is there**,
+not a write — and `~/.claude.json` also holds Claude Code's own state (`numStartups`,
+`machineID`, `userID`, `seenNotifications`, `pluginUsage`) beside our theme/onboarding/root
+preseed, so a `jq -n` rewrite here would trade a trust stall for a theme-picker stall.
+
+New harness `tests/workdir_trust_seed_unit.sh` (57 assertions, 0.9s measured on the 5dive control plane, core) extracts the real
+block from the real script by its guard line and runs it against fake homes and fake workdir
+roots — no root, no network, no claude binary, no host paths. It proves the extraction found
+real code before trusting a result, and it grades six mutants against the shipped bytes:
+the fix reverted, a `jq -n` rewrite, an entry added without the boolean, a guard keyed on the
+sandboxed path shape, an equality-only skip, and — the ticket's named one — the workdir
+resolved too early, i.e. the create-path patch that passes an empty string for exactly the
+sandboxed case. Every one goes red on the arm it should break.
+
+## v0.19.14 — fix(task): an explicit `--no-verify` is recorded, so overriding it is no longer silent (DIVE-2730)
+
+`--no-verify` was an add-time shell variable with no column behind it, so it died with the
+`task add` process. By `task done` an EXPLICIT opt-out and a row nobody ever railed were the same
+stored state — verifier NULL, `verify_unavailable` NULL — so when DIVE-2719's UPGRADE arm attached a
+grader to a blast-radius delivery, it could not tell which one it was overriding, and said nothing.
+
+`tasks.verify_optout` (additive, nullable, NULL for every existing row) records the refusal at add
+time. A decision and a default that produce the same stored state ARE the same state; nothing
+downstream recovers the difference, however carefully it reasons, because the distinguishing fact was
+never written down.
+
+**The upgrade still fires on an opted-out row, deliberately.** `--no-verify` is declared at FILE
+time; the blast radius is measured at DELIVERY time. Letting the stored flag suppress the upgrade
+would let a sentence typed before the diff existed pre-authorise closing a scheduler, task-store,
+credentials or deploy change ungraded — a waiver in the direction DIVE-969 banned, and the one way
+persisting this column could have turned a fix into a bypass. The filer opted out of ROUTINE grading,
+not of grading a diff they had not written yet. So the column is a RECORD, not a control: what
+changes is that `task done` now names the opt-out it is overriding instead of silently routing.
+That silence was the defect the row was filed for.
+
+The flag is set only by `task add --no-verify` and cleared by `5dive task verifier <id> <agent>`,
+since an explicit later attach supersedes the earlier refusal. Because it gates nothing, a stale flag
+can at worst produce a slightly wrong explanatory sentence — it can never waive a rail.
+
+The instructive contrast is `verify_unavailable=1`, which self-handles on the same code path for a
+different reason: it is a persisted column, so `_task_default_verifier` returns empty again in that
+org and the upgrade cannot fire for want of a GRADER, rather than for want of permission.
+
+## v0.19.14 — fix(task): verification depth is re-measured at delivery, from the paths the work touched (DIVE-2719)
+
+The defect was the TIMING, not the ruleset. `task add` decided how deeply a task would be graded
+from its PRIORITY and a KEYWORD REGEX over its TITLE — because at `task add` there is no branch, no
+diff and no PR, so the words in the title are the only axis that exists. The classifier was being
+asked at the one moment it could not be answered.
+
+Measured on DIVE-2712: the title described a real user-facing Telegram defect, correctly, so it
+earned the full verifier rail. The delivered change was ONE LINE in a test stub. Four verifier
+iterations graded it. No title classifier could have known — the fact had not happened yet.
+
+So the question is asked again at DELIVERY, where the answer is a measurement. `task done` reads the
+changed paths off the PR the row already binds (`delivery_ref`, or the DIVE-1462 `Branch:` line) and
+either confirms the add-time guess, DOWNGRADES it (every path is a test, a doc or a changelog
+fragment — CI is the gate there, and a grading round-trip adds latency and no signal) or UPGRADES it
+(a row filed as a chore whose diff reached the scheduler, the task store, credentials or deploy now
+routes to a grader instead of closing outright). Path globs only, both lists under ten entries; this
+is deliberately not a taxonomy.
+
+Unknown stays unknown. No binding, no `gh`, no credential, or no PR found all produce an empty path
+list, and an empty list classifies as neither — so a missing credential can never widen or narrow
+the rail, and an ordinary unbound close does not spend a single API call.
+
+This is not the done-time waiver DIVE-969 banned. That ruling refuses a waiver the MAKER ASSERTS at
+peak completion-incentive; this asserts nothing. To be classified shallow you must have genuinely
+changed only tests and docs, in which case there is nothing for a grader to grade. A downgraded
+close still has to satisfy the DIVE-1830 merge gate.
+
+One limit, stated rather than glossed when this shipped, and **closed by DIVE-2730 in the same
+release**. The add-time opt-out (`--no-verify`) was not persisted — it was an add-time shell variable
+with no column behind it — so at `task done` a `--no-verify` row was indistinguishable from a
+DIVE-969 auto-skipped one: both carry a NULL verifier. The UPGRADE arm tests exactly that shape, so
+an explicit opt-out whose diff reached the blast radius was given a grader anyway, without being able to say so. The
+override itself was right — the flag is declared before the diff exists — and it could only ADD a
+rail, never waive one, so the DIVE-969 posture was intact throughout. What was missing was the
+record: `tasks.verify_optout` now stores the refusal and the upgrade names what it overrides. See
+DIVE-2730 below.
+
+**The same defect, one function over.** `_task_default_verifier` picked the GRADER by walking UP the
+org chart — project lead, coordinator, the maker's manager, the org root, the deputy. Every rung is a
+leader, so a leader was structurally guaranteed to win. lodar ruled on 2026-08-04: "you should never
+be verifier yourself" / "why our ceo acts as ci tool". The remedy applied that morning moved 58 rows
+off main and cleared 6 more, and did not touch the picker — so by that evening six MORE rows created
+the same day carried verifier=main again. Correcting the output of a rule leaves the rule producing
+it. A chart that names a QA agent has already answered who should grade, and nobody had asked it: the
+org's designated QA/testing/verification agent is now the FIRST rung, ahead of every leader.
+`FIVE_VERIFY_EXCLUDE=<names>` hard-excludes named agents from the default chain the way the maker is
+already excluded, so the next such ruling is data rather than a code change. It is empty by default —
+this ships inert on that half and changes no selection until an org sets it.
+
+## v0.19.14 — fix(gh,task): a maker with no GitHub credential can now READ the state of their own work (DIVE-2296)
+
+A builder holds no gh credential by design — one who cannot force-push cannot
+quietly rewrite what a reviewer already read. Nothing in that design says they may
+not LOOK. Measured on DIVE-2286: one task needed another agent at five points, and
+two of them were reads — a gate asking someone to open a PR the maker had opened
+fifteen minutes earlier, then two more asking for a merge that was waiting on an
+18-minute CI run. A maker who cannot read the state of their own work has exactly
+one move, and every one of them is a round trip.
+
+Two surfaces closed that window:
+
+- **`5dive gh` routed a READ to the caller's own credential**, which on a seat
+  holding none is a refusal — and the refusal named the escape as "`--as=bot` if
+  this is a **write**", steering the one caller who needed it away from the one
+  path that answers. A credential-less read now routes to the bot, and the
+  surviving refusal says `--as=bot` serves reads too. This grants no authority:
+  admin-class work is still refused there (5dive-bot is `admin=false`), the same
+  token was already reachable by typing `--as=bot` by hand, and the bot's read
+  visibility is a subset of an authed caller's. An authed caller and an explicit
+  `--as=caller` are unchanged.
+
+- **The DIVE-1830 merge gate's branch-path refusal** read identically whether no PR
+  existed for the branch or one was open and mid-CI — opposite situations, one
+  sentence. It now looks the open PR up and names it, with its check state, so
+  "wait" and "go open one" are distinguishable. Diagnostic only: an open PR accepts
+  nothing, `done=merged-to-main` is unchanged, and the lookup runs on the refusing
+  path so no close that passes pays for it.
+
+`tests/gh_credentialless_read_route_unit.sh` grades both halves, with anchors
+pinning that the authed-caller route, `--as=caller`, write routing and the gate's
+acceptance are all untouched.
+
+## v0.19.14 — feat(task): per-template `--on-overlap=skip|spawn` for recurring templates (DIVE-2272)
+
+Skip-if-open dedup is a claim about the **value of a pile-up**, and that value is class-dependent —
+so it cannot be a fleet-wide setting. For a fungible chore (disk reclaim, hygiene sweep) three open
+instances are three copies of one job: noise, and dedup is right. For a reading-of-the-present job
+(recap, version loop, CEO loop) Tuesday's instance cannot be discharged by Wednesday's run, so three
+open instances mean **nobody has read the inbox in three days** — the pile-up *is* the alarm the
+dedup deletes. Only the template's author knows which kind a template is; the scheduler cannot infer
+it. Decision and rejected options: `community/wiki/pile-up-is-noise-for-a-chore-and-signal-for-a-monitor.md`.
+
+- `--on-overlap=skip` — **the default, and today's behaviour byte for byte.** An open instance
+  suppresses the next slot.
+- `--on-overlap=spawn` — fire regardless of open instances, **up to a bound** (`--overlap-bound`,
+  default 3). At the bound it skips **and stamps `last_skipped_at`**, i.e. degrades to exactly the
+  already-legible suppression path rather than inventing new alarm machinery, so
+  `task ls --recurring` and the DIVE-2237 reading table keep working unchanged.
+- `5dive task set-overlap <template> <skip|spawn> [bound]` classifies an **existing** template.
+  Every template on the board predates the column, and re-creating one to classify it would cost its
+  ident, its history and its `last_fired_at` — the very record that says whether the beat is healthy.
+
+**The bound of 3 is a judgment call, not a measurement** (3 open recaps is unmistakable to a human;
+300 is a different outage). Per-template overridable and env-tunable (`HEARTBEAT_OVERLAP_BOUND`)
+precisely so the number is never read as derived.
+
+**No-op migration.** `on_overlap` and `overlap_bound` are both nullable: NULL means "skip" / "the
+default bound". Deliberately not `NOT NULL DEFAULT 'skip'` — a backfilled default and an unset value
+would then be indistinguishable, and *"nobody has classified this template yet"* is a state the
+classification pass has to be able to see.
+
+### The prerequisite this shipped behind, and why it was not tidiness
+
+DIVE-2273 (landed) had to come first. Today `open` is consumed as a **boolean** — any nonzero skips
+— so the old failure sentinel `1` was wrong but **conservative**: it erred toward not acting. This
+change promotes `open` to a **magnitude** compared against a bound, and that promotion re-aims the
+sentinel without touching the error handling: `1 < 3`, so a failed read would produce the
+**permissive** outcome and start *causing writes*. Worse, **the bound is spawn's safety valve and it
+is computed from the same unreliable read it backstops** — a failing read pins `open` at 1, the bound
+never trips, and the degrade path cannot engage in exactly the conditions that call for it.
+
+So the unreadable-count branch `continue`s **before** the policy branch: a failure never reaches the
+magnitude at all. The general rule, worth more than this feature: **when you widen how a value is
+consumed, re-audit its error sentinel — the sentinel was chosen against the old consumer.**
+
+Acceptance arms **force the count read to fail** (both forging inputs: a non-zero exit, and rc 0 with
+empty output) under `spawn` and assert the tick neither spawns nor stamps. A healthy-read arm proves
+nothing about this property. Verified by mutation: restoring the fail-open makes the spawn template
+spawn on an unreadable DB, and the arm goes red.
+
+### Cardinality: four consumers that assumed at most one open instance
+
+Allowing more than one open instance per template makes a claim every downstream reader had been
+free to assume. All readers of `from_template_id` were swept; `blocked_by`'s subquery was already
+`ORDER BY i.id LIMIT 1` and safe, but four consumers stated a **dedup premise as fact** and would
+have reported a cause they did not observe — the DIVE-2273 defect class, one layer out:
+
+- **`task ls --recurring`'s `blocked_by`** is now policy-aware. Under `spawn` an open instance does
+  not block, so printing its ident would send a reader to close a row that is suppressing nothing. A
+  spawn template reads `-` until it is **at** its bound, then `bound N/B`. The expression reproduces
+  the materializer's own branch and reads the same default constant, so the listing cannot tell a
+  different story than the scheduler (the DIVE-2055 rule for that table). A new `on_overlap` column
+  shows the policy directly.
+- **Recurring-stall rung 1** no longer asserts "the next slot is SUPPRESSED, so the beat is not late,
+  it is not happening" on a spawn template, where later slots keep firing. It says the beat is late,
+  and that the row consumes a bounded slot.
+- **Rung 2's auto-cancel** justified itself with "cancelled BECAUSE skip-if-open was suppressing every
+  later slot". The **action** is unchanged for both policies (a never-started row is a stall either
+  way), but the written reason now matches what the scheduler actually does.
+- **`task park`'s DIVE-2877 warning** said the park "STOPS THAT BEAT". Under `spawn` it does not — it
+  consumes one bounded slot for as long as it stays parked, and since the stall watchdog skips parked
+  rows, enough of them silently convert a spawn template into a suppressed one. Both facts are now
+  said, each under the policy that makes it true.
+
+### An empty field in the middle of a tab-separated row disappears
+
+Adding two columns to the materializer's driving query turned up a latent trap. The query was
+`|`-joined, `tr`'d to tabs, and read with `IFS=$'\t'` — but **tab is an IFS *whitespace* character**,
+so bash collapses runs of it and an **empty field in the middle of the row silently vanishes**,
+shifting every column after it. The old three-column form survived only because its one nullable
+field was **last**. With `on_overlap` after `last_fired_at`, the symptom was not a parse error but
+`last_fired` holding the policy string — after which the same-minute guard rejected every template
+and **the materializer silently stopped firing anything at all**. Now `x'1f'`-joined and read with
+`IFS=$'\x1f'`, the separator the stall sweeps beside it already use, which is not IFS whitespace and
+preserves empty fields.
+
+### Not in scope, deliberately
+
+Gate age still has no monitor outside the thing it watches. This flag shrinks the blast radius of a
+stuck recap; it does not fix that coupling. The per-template **classification** of the existing
+templates is also not applied here — it is a proposal that needs each template owner's confirmation
+(the rule: *would tomorrow's run discharge today's obligation?*), and applying it unilaterally would
+be the same "the scheduler cannot infer the class" mistake this change exists to fix.
+
+## v0.19.14 — feat(agent): map the hermes and openclaw persona paths, measured on live seats (DIVE-2245)
+
+DIVE-2223 routed every persona to the file its harness actually reads and left two rows out on
+purpose: `hermes` and `openclaw` had never been probe-verified, and a guessed row would have
+restored the exact defect that ticket removed — a confident write into a path with no consumer,
+which looks fixed. Creating one with a role has warned loudly and installed nothing since. A loud
+no-op beats a silent one and is still a no-op.
+
+Both rows are now measured, with the before/after role probe the map's other rows were held to:
+
+| harness | path | baseline | after the doc was installed |
+|---|---|---|---|
+| `hermes` | `~/.hermes/SOUL.md` | NOT TOLD | "I am Quill, the Release Archivist… reporting to agent-dev" |
+| `openclaw` | `~/.openclaw/workspace/AGENTS.md` | NOT TOLD | "…my job title on this team is Ledger Steward" |
+
+**The guess was wrong on both, in two different ways** — which is the argument for the probe, not
+just its receipt. The ticket proposed `~/.hermes/AGENTS.md`: hermes' prompt builder loads
+`AGENTS.md` / `CLAUDE.md` from the **CWD only**, so a home-level one is read by nothing, while the
+slot it does read from `HERMES_HOME` and always injects is `SOUL.md`. And openclaw's is not a
+dotfile path at all — it injects a fixed set of **workspace** files (`AGENTS.md`, `SOUL.md`,
+`TOOLS.md`, `IDENTITY.md`, `USER.md`) from `~/.openclaw/workspace`, so the row carries a directory
+no other harness in the map uses.
+
+Both are **occupied slots**, like codex's: `hermes gateway install` preseeds `SOUL.md` with the
+Nous default identity, and openclaw's first-run bootstrap writes its whole workspace set, both
+during create. `persona_install_doc` already prepends, so the harness's own defaults survive.
+
+Consequence beyond the map: `pack install` and `agent import --from-persona` now **reach** both
+harnesses. `tests/pack_cross_harness_unit.sh` asserted hermes and openclaw were *excluded*; those
+two rows now assert they are targets.
+
+`devin` inherits the refusal. It is a registered type (`TYPE_BIN`, `TYPE_AUTH`, `TYPE_INSTALL`, a
+channels row) with no persona path and no probe, so it is the only known type left in the loud
+no-op state — the refusal names **DIVE-3129** instead of this row, and the unit test's
+"a known-unmapped type names its tracking ticket" arm moved onto it rather than being deleted.
+The exclusion arms in `pack_cross_harness_unit.sh` moved the same way, including the
+cannot-widen-past-the-persona-map manifest, which would otherwise have started widening
+successfully.
+
+Graded by mutation, since two new rows in a table are the easy thing to assert vacuously:
+rerouting hermes to the guessed `~/.hermes/AGENTS.md` goes red on the path, and deleting the
+openclaw row goes red in both harnesses (`persona_target refused a mapped type`, and `T1e`).
+
+## v0.19.14 — fix(agent): the credential guard no longer FAILS OPEN when it cannot see the pane (DIVE-2159)
+
+`agent send` / `ask` / `_deliver` and the heartbeat nudge all refuse to type into a pane that is
+sitting on a login screen (DIVE-2137, gh#214) — a message typed there becomes the agent's stored
+API key. But the guard captured that pane with `tmux capture-pane ... 2>/dev/null || true`, which
+**throws away capture-pane's exit status**. A capture that FAILED therefore arrived at the matcher
+as an empty string, an empty string is not a login prompt, and the guard returned "safe to type":
+**send anyway**. Could-not-measure rendered identically to measured-and-safe, inside the guard built
+to stop exactly that.
+
+The dangerous case is not a pane that is missing because the agent is gone — that send fails on its
+own. It is a capture that fails *transiently while the agent is parked on a login prompt*: precisely
+when the guard is load-bearing, and precisely the state gh#214 described. A guard that abstains under
+stress is weakest exactly when it is needed.
+
+The two states are distinguishable and the `|| true` was discarding the discriminator (measured,
+tmux 3.4): a missing pane or an unknown `sudo -u` user returns **rc 1** with empty stdout, while a
+live pane with nothing drawn yet returns **rc 0** with empty stdout. The signal is the return code,
+never the emptiness.
+
+The guard now **retries the capture (3 bounded attempts, ~0.25s apart) and then fails closed, loudly**
+— retry first because the motivating failure is a flake and a bare fail-closed would turn that flake
+into blocked inter-agent traffic; fail closed after, because the alternative is the defect; loud
+because a silent abstention is what kept gh#214's root cause invisible for a day. `send`/`ask`/
+`_deliver` raise a hard `E_AUTH_REQUIRED`, and the heartbeat logs a named skip.
+
+The refusal receipt now says **which** thing happened. An unreadable pane is no longer reported as
+"parked on a CREDENTIAL/LOGIN prompt": nobody saw a login prompt, and asserting one sends the
+operator off to re-seed a credential that may be perfectly fine — the same unmeasured-claim shape as
+the defect, one level up. It names DIVE-2159, states that nothing was typed, and still names the
+`FIVE_ALLOW_CREDENTIAL_PANE=1` override (checked *before* the capture, so it also unblocks a box
+where capture is broken outright).
+
+## v0.19.14 — fix(audit): a command that FAILS now writes its audit row (DIVE-2130)
+
+Two independent defects made the audit log silently skip rows, so "absent from
+the audit log" did not mean "it did not happen" — on `push`, the privileged
+outward-facing rail whose row is the fleet's only record that a delegated push
+occurred.
+
+- `_actor_identity_claim` ended its agree-branches with a bare `return`, which
+  hands back `$?`. Called from `audit_log`, which the EXIT trap invokes with the
+  process's own exit status still pending, it returned the *failing* status —
+  tripping `set -e` inside the trap and killing the shell before the row was
+  rendered. Every dispatcher-audited verb that exited non-zero wrote nothing
+  from 2026-08-02 onward. Every `return` on that path is now explicit.
+- `jq --args` does not stop jq's option parsing, so any argument beginning with
+  `-` (and `AUDIT_ARGS` is `("$@")` for most verbs) made jq exit with "Unknown
+  option", stderr swallowed, and the row dropped — pass or fail. The positional
+  list is now separated with `--`.
+
+A row that still cannot be rendered leaves a drop marker in `notify/` instead of
+evaporating, and the EXIT trap's call to `audit_log` can no longer abort the
+trap, so "audit is best-effort" is now true of the writer and not only of its
+comments.
+
+## v0.19.14 — feat(selfcheck): ship-ledger liveness, so a ZERO in the ship ledger is a measurement and not an absence (DIVE-2129)
+
+`5dive selfcheck` gains a `ship-ledger-liveness` probe. DIVE-1923 built the ship
+ledger (`5dive push` → `ship_events`) and closed saying that no row appearing after
+the fleet rolled and pushed would be a real signal. Measured, it was not: the
+instrument armed at 23:35:15Z and the last push through the rail was at 23:14:41Z,
+so there had been **zero** pushes since arming and the watch would have fired on
+nothing. An uninstalled or unexercised instrument renders identically to a healthy
+one with no events.
+
+The probe reports three verdicts, never two — `LIVE` (a post-arming push and a
+matching row: the capture path is proven end to end), `BROKEN` (a post-arming push
+and zero rows: the only alarming state), and `NOT-REACHED` (no push has crossed the
+rail since arming, stated with the arming and last-push stamps, and never folded
+into a pass).
+
+The non-vacuity denominator is the deliverable. It never comes from `ship_events`,
+since counting pushes from the table under test makes `0/0` self-certifying forever.
+It counts only `result=ok` pushes, because a refused push never reaches the writer
+and counting one manufactures a false `BROKEN`. It is anchored to the running
+bundle's acquisition of the writer — read as a symbol in the artifact, not as a
+version string — and a `BROKEN` is written down so a nightly roll that moves the
+bundle's mtime cannot silently reset the alarm with the window. And because 5dive's
+own audit sink was measured recording push events non-uniformly, an *empty*
+denominator is trusted only when two independent sinks (the agent audit log and
+sudo's journal) are both proven to be writing and both agree; a disagreement is its
+own named not-reached reason rather than a silent preference for one of them.
+
+## v0.19.14 — fix(task): surface cited-not-delivered BEFORE the close, not with it (DIVE-2096)
+
+Two agents hit the identical wall from opposite sides inside ~2h on 2026-07-26 — olivia on
+DIVE-2064, main on DIVE-2080. main closed, and the merge-gate warned **in the same breath as
+closing** that PR #209 was CITED not DELIVERED, so nothing bound it and its merge state was
+never checked. `done` then froze the body, so the record could not be repaired, and the only
+remedy the warning could name — bounce it back to the maker to fix the verifier's own
+metadata — is wildly disproportionate to the error. Two operators, one tool defect: the
+diagnosis and the point of no return arrived together, and nothing anywhere hinted at the
+correct sequence (merge → `task deliver --pr` → `done`) while there was still time to follow it.
+
+`task done` now **refuses, pre-commit**, when the result/body names a pull request and
+**nothing binds one to the task** — no `delivery_ref`, no `Branch:` line — and names the
+remedy with the ident already filled in. Status, result and body are untouched by the refusal,
+which is the entire point: the record is still repairable.
+
+**The shape is ordering, not inference.** DIVE-1962 was CANCELLED for proposing to infer the
+binding from a PR number in prose, because that overclaims — an incidental number stamps an
+unrelated close UNVERIFIED. So prose is the **trigger** for the prompt and never the **source**
+of the binding: nothing reads the number into `delivery_ref`, and a test arm pins that. DIVE-1965's
+delivered-vs-cited distinction is likewise untouched — this refuses, it never reclassifies.
+
+Escapes, both audited: `--no-pr` is the named opt-out for DIVE-1965's genuine reports-on
+category (a review, triage, audit or coordination close that ships no code of its own), and
+`--force-merge-gate` overrides as it does everywhere else. `--no-pr` is a **claim about the
+close**, so it lands a `task.done-no-pr` audit row — an unrecorded assertion is
+indistinguishable from a bypass when someone reads the row back later.
+
+Mutation-graded (`tests/task_done_cited_preclose_unit.sh`, 19 arms): the harness re-runs itself
+against two mutant trees — the pre-check neutered, and the `--no-pr` opt-out neutered — and
+**requires each to red**, because assertions about a refusal and about absences of one both pass
+trivially against a build where the check does nothing.
+
+## v0.19.14 — fix(task): a routed gate says WHO it went to and WHY, at file time (DIVE-2093)
+
+`task need` has always printed the reviewer and the ROLE — *"routed to main2 for verifier
+review"*. It never printed the **property that chose that reviewer**, and that omission cost
+five round trips across four agents in two weeks: dev3 on DIVE-2084 ("open the PR" landed on
+someone holding no `gh`), main on DIVE-2146, olivia immediately after, main2 on DIVE-2798 and
+again on DIVE-2808. Every one of them was **invisible on the board** — a gate pending on the
+wrong principal renders exactly like a gate pending on the right one, so the only way anyone
+learned was the answer that never came.
+
+The routed line now carries the basis:
+
+```
+OK — DIVE-2798 routed to main2 for verifier review (approval, tier 1) [why: routed by LOOP
+MEMBERSHIP — main2 is this task's verifier of record (tasks.verifier). That property carries
+NO information about which capabilities main2 holds, so if this ask needs an ACTION performed
+(open a PR, push, spend, provision a secret) rather than a judgement made, it is on the wrong
+desk: re-file with --tier=2, or --needs=<capability>, or hand it to a holder.
+trigger=verifier-route]
+```
+
+The lead rail names its own edge instead (`agents_org.reports_to`, both ends), so the two
+bases are never confusable. `--json` carries `route_basis` and `route_trigger` for readers
+that should not be parsing prose. The reported trigger is the **most specific** routable kind
+that applies, not whichever clause of the disjunction short-circuited first.
+
+**And the sharper variant, from DIVE-2808.** When the ask is push/deploy shaped, the filing
+now measures whether the routed seat can mint a DIVE-756 closure signature at all, and says so
+in the same breath. A `cli-scoped` seat can ANSWER an approval and cannot SIGN it — so the
+board shows an approved gate, `need_answer_sig` lands empty, and the delegated push is refused
+later, on the MAKER's command, reading as tampering. DIVE-2760 already warns the answerer;
+that shortens the loop and does not close it, because by then a diff has been read and an
+answer given. **Filing is the only moment at which nobody has yet acted.**
+
+An unmeasurable sudo grant reports `unknown, not a no` (DIVE-2318) and never produces the
+warn: a false negative would send a filer to re-route a gate that would have cleared fine.
+Non-push asks print no require_sig clause at all — a notice that fires on every gate is
+wallpaper (DIVE-1955) and stops being read.
+
+This does **not** re-route anything. Routing on (gate type, requested capability) rather than
+on loop membership is the other half, and it sequences with DIVE-2089.
+
+## v0.19.14 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -34,7 +1506,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.19.14 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -76,7 +1548,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.19.14 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -140,7 +1612,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.19.14 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
